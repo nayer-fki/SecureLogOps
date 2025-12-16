@@ -1,2 +1,4 @@
 # SecureLogOps
-Secure logging &amp; SOC platform (ELK, Wazuh, DevSecOps)
+
+Secure logging & SOC platform  
+Stack: ELK, Wazuh, DevSecOps, Kubernetes
