@@ -1,0 +1,38 @@
+# --- Wazuh alerts -> Elasticsearch (minimal + stable) ---
+
+filebeat.inputs:
+  - type: filestream
+    id: wazuh-alerts
+    enabled: true
+    paths:
+      - /var/ossec/logs/alerts/alerts.json
+
+    # Wazuh alerts.json = ndjson (json لكل سطر)
+    parsers:
+      - ndjson:
+          target: ""
+          add_error_key: true
+
+    fields_under_root: true
+    fields:
+      event.module: wazuh
+      event.dataset: wazuh.alerts
+      service.name: wazuh-manager
+
+processors:
+  - add_host_metadata: {}
+  - add_cloud_metadata: {}
+  - add_docker_metadata: {}
+
+# خفّف setup/ilm باش ما يعملش مشاكل
+setup.template.enabled: false
+setup.ilm.enabled: false
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  username: "elastic"
+  password: "ChangeMe_Elastic123!"
+  index: "wazuh-alerts-%{+yyyy.MM.dd}"
+
+logging.level: info
+

@@ -1,0 +1,126 @@
+services:
+  # ---------------- SEARCH SERVICE ----------------
+  search-service:
+    build:
+      context: /home/nayer/Bureau/SecureLogOps/search-service
+      dockerfile: Dockerfile
+    container_name: search-service
+    environment:
+      - ES_URL=http://elasticsearch:9200
+      - ES_USER=elastic
+      - ES_PASS=ChangeMe_Elastic123!
+      - ES_INDEX=logs-ingest-dev
+      - SEARCH_API_KEY=ChangeMe_Search123!
+      - REQUEST_TIMEOUT=10
+    ports:
+      - "8002:8002"
+    networks:
+      - data-layer_data_net
+    depends_on:
+      - elasticsearch
+
+  # ---------------- WAZUH MANAGER ----------------
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.7.2
+    container_name: wazuh-manager
+    hostname: wazuh-manager
+    ports:
+      - "55000:55000"
+    environment:
+      - WAZUH_API_USER=wazuh
+      - WAZUH_API_PASSWORD=wazuh
+    volumes:
+      - wazuh_ossec:/var/ossec
+      - ./wazuh/filebeat:/etc/filebeat:ro
+    networks:
+      - data_net
+
+
+
+
+  # ---------------- SECURITY SERVICE ----------------
+  security-service:
+    build:
+      context: /home/nayer/Bureau/SecureLogOps/security-service
+      dockerfile: Dockerfile
+    container_name: security-service
+    environment:
+      - API_KEY=ChangeMe_Security123!
+
+      # ---------------- Alerts source (IMPORTANT) ----------------
+      # ✅ force summary to use Elasticsearch first
+      - ALERTS_SOURCE=elasticsearch
+
+      # ✅ Elasticsearch source for wazuh alerts
+      - ES_URL=http://elasticsearch:9200
+      - ES_USER=elastic
+      - ES_PASS=${ELASTIC_PASSWORD:-ChangeMe_Elastic123!}
+      - WAZUH_ES_INDEX=wazuh-alerts-*
+
+      # ---------------- Wazuh API (optional) ----------------
+      # نخليهم موجودين لكن ماعادش summary يعتمد عليهم
+      - WAZUH_URL=https://wazuh-manager:55000
+      - WAZUH_API_USER=wazuh
+      - WAZUH_API_PASSWORD=wazuh
+
+      # ---------------- Modes ----------------
+      - MOCK_MODE=false
+
+      # ---------------- Fallback (optional) ----------------
+      # ✅ خليها true باش إذا ES فشل يرجع للـ alerts.json بدل ما يطيّح endpoint
+      - USE_WAZUH_FILE_FALLBACK=true
+      - WAZUH_ALERTS_FILE=/var/ossec/logs/alerts/alerts.json
+
+      # (اختياري) تجاهل SSL issues إذا تستعمل https داخليًا
+      - WAZUH_SSL_VERIFY=false
+
+    ports:
+      - "8003:8003"
+    volumes:
+      - wazuh_ossec:/var/ossec:ro
+    networks:
+      - data_net
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      wazuh-manager:
+        condition: service_started
+    restart: unless-stopped
+
+
+  
+  # ---------------- INCIDENT SERVICE ----------------
+  incident-service:
+    build:
+      context: /home/nayer/Bureau/SecureLogOps/incident-service
+      dockerfile: Dockerfile
+    container_name: incident-service
+    environment:
+      - MONGO_URI=mongodb://admin:ChangeMe_Mongo123!@mongodb:27017/?authSource=admin
+      - DB_NAME=securelogops
+      - INTERNAL_API_KEY=ChangeMe_Internal123!
+      - AUTH_ENABLED=true
+      - JWT_SECRET=ChangeMe_JWT_Secret123!
+      - JWT_ALGORITHM=HS256
+    ports:
+      - "8004:8000"
+    networks:
+      - data-layer_data_net
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+
+
+networks:
+  data-layer_data_net:
+    external: true
+
+volumes:
+  esdata:
+  wazuh_ossec:

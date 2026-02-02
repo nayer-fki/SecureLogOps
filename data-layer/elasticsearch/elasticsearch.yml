@@ -1,0 +1,7 @@
+cluster.name: securelogops
+network.host: 0.0.0.0
+discovery.type: single-node
+
+xpack.security.enabled: true
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false

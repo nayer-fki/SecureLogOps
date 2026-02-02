@@ -1,0 +1,42 @@
+filebeat.inputs:
+  - type: filestream
+    id: linux-syslogs
+    enabled: true
+    paths:
+      - /host/var/log/syslog
+      - /host/var/log/auth.log
+      - /host/var/log/kern.log
+      - /host/var/log/daemon.log
+      - /host/var/log/user.log
+
+    parsers:
+      - multiline:
+          type: pattern
+          pattern: '^\s'
+          negate: false
+          match: after
+
+processors:
+  - add_host_metadata: {}
+  - add_fields:
+      target: ""
+      fields:
+        source: "filebeat"
+
+output.http:
+  enabled: true
+  url: "http://ingest-service:8000/logs"
+  headers:
+    X-API-Key: "${INGEST_API_KEY}"
+  # filebeat يبعث JSON كامل
+  # ingest-service لازم يقبل dict / message field
+  compression_level: 3
+  timeout: 5s
+  retry:
+    max_retries: -1
+    wait_min: 1s
+    wait_max: 10s
+
+logging.level: info
+logging.to_files: false
+logging.to_stderr: true

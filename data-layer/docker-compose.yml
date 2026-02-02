@@ -1,0 +1,278 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+    container_name: elasticsearch
+    environment:
+      - node.name=es01
+      - cluster.name=securelogops
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-ChangeMe_Elastic123!}
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      data_net:
+        aliases:
+          - wazuh.indexer
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  kibana-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+    container_name: kibana-setup
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - data_net
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-ChangeMe_Elastic123!}
+      - KIBANA_SYSTEM_PASSWORD=${KIBANA_SYSTEM_PASSWORD:-ChangeMe_Kibana123!}
+    command: >
+      bash -c '
+      echo "Waiting for Elasticsearch..." &&
+      until curl -s -u elastic:$${ELASTIC_PASSWORD} http://elasticsearch:9200 >/dev/null; do sleep 2; done &&
+      echo "Setting kibana_system password..." &&
+      curl -s -u elastic:$${ELASTIC_PASSWORD} -H "Content-Type: application/json" -X POST
+      http://elasticsearch:9200/_security/user/kibana_system/_password
+      -d "{\"password\":\"$${KIBANA_SYSTEM_PASSWORD}\"}" >/dev/null &&
+      echo "kibana_system password set ✅"
+      '
+    restart: "no"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.1
+    container_name: kibana
+    depends_on:
+      kibana-setup:
+        condition: service_completed_successfully
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_NAME=kibana
+
+      - ELASTICSEARCH_HOSTS=["http://elasticsearch:9200"]
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD:-ChangeMe_Kibana123!}
+
+      - XPACK_SECURITY_SECURECOOKIES=false
+
+      # ✅ Fix: encryption keys ثابتين باش dashboards ما يضيعوش و features ما تتعطلش
+      - xpack.encryptedSavedObjects.encryptionKey=eb79e0a938a806ec47b829a91d3586f8
+      - xpack.reporting.encryptionKey=7dd6c9cc3a0a1e46d4ba1eb15ec666a3
+      - xpack.security.encryptionKey=9522ed43701c8aecf013ec48712077a9
+
+      # ✅ (اختياري) يخفّف warnings على hostname
+      - xpack.reporting.kibanaServer.hostname=localhost
+
+    ports:
+      - "5601:5601"
+    networks:
+      - data_net
+    restart: unless-stopped
+
+
+  logstash:
+    build:
+      context: ./logstash
+      dockerfile: Dockerfile
+    container_name: logstash
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ES_HOST: http://elasticsearch:9200
+      ES_USER: elastic
+      ES_PASS: ${ELASTIC_PASSWORD:-ChangeMe_Elastic123!}
+      LS_JAVA_OPTS: "-Xms512m -Xmx512m"
+      xpack.monitoring.enabled: "false"
+    # ملاحظة: نخليها كما هي (حتى لو 8080 ما يستعملهاش)
+    ports:
+      - "8080:8080"
+      - "9600:9600"
+    networks:
+      - data_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - data_net
+
+  ingest-service:
+    build: ./ingest-service
+    image: securelogops-ingest:latest
+    container_name: ingest-service
+    depends_on:
+      - redis
+      - logstash
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=${APP_ENV:-dev}
+      - INGEST_API_KEY=${INGEST_API_KEY:-ChangeMe_IngestKey_123}
+
+      - LOGSTASH_BASE_URL=${LOGSTASH_BASE_URL:-http://logstash:8080}
+
+      - USE_REDIS_BUFFER=${USE_REDIS_BUFFER:-true}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+
+      # old pipeline keys (keep)
+      - REDIS_QUEUE_KEY=${REDIS_QUEUE_KEY:-ingest:queue}
+      - REDIS_DLQ_KEY=${REDIS_DLQ_KEY:-ingest:dlq}
+
+      # ✅ Upload queue (must match uploads.py)
+      - INGEST_QUEUE_KEY=ingest:jobs
+
+      # ✅ Upload worker (the one that indexes uploads to Elasticsearch)
+      - UPLOAD_WORKER_ENABLED=true
+      - UPLOAD_WORKER_CONCURRENCY=1
+
+      # ✅ Existing worker(s) (legacy pipeline) — keep ON only if you need it
+      - WORKER_ENABLED=false
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-1}
+
+      - MAX_RETRIES=${MAX_RETRIES:-8}
+      - BASE_BACKOFF_MS=${BASE_BACKOFF_MS:-250}
+
+      # ✅ Elasticsearch for upload indexing
+      - ES_URL=http://elasticsearch:9200
+      - ES_USER=elastic
+      - ES_PASS=ChangeMe_Elastic123!
+      - UPLOADS_INDEX=uploads-audit
+
+    ports:
+      - "8000:8000"
+    networks:
+      - data_net
+
+
+  beats-bridge:
+    image: docker.elastic.co/logstash/logstash:8.11.1
+    container_name: beats-bridge
+    depends_on:
+      - ingest-service
+    env_file:
+      - .env
+    environment:
+      - LS_JAVA_OPTS=-Xms256m -Xmx256m
+      - xpack.monitoring.enabled=false
+    volumes:
+      - ./beats-bridge/beats-bridge.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    ports:
+      - "5044:5044"
+    networks:
+      - data_net
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.11.1
+    container_name: filebeat
+    user: root
+    depends_on:
+      - beats-bridge
+    env_file:
+      - .env
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/log:/host/var/log:ro
+    networks:
+      - data_net
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=ChangeMe_Mongo123!
+      - MONGO_INITDB_DATABASE=securelogops
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db
+    networks:
+      - data_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet -u admin -p ChangeMe_Mongo123! --authenticationDatabase admin --eval 'db.runCommand({ping:1}).ok' | grep 1 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  correlation-service:
+    build: ./correlation-service
+    container_name: correlation-service
+    environment:
+      - ES_URL=http://elasticsearch:9200
+      - ES_USER=elastic
+      - ES_PASS=${ELASTIC_PASSWORD:-ChangeMe_Elastic123!}
+
+      # ✅ include classic indices + data-stream backing indices
+      - ES_INDEX=logs-*,.ds-logs-*-*
+
+      - MONGO_URI=mongodb://admin:ChangeMe_Mongo123!@mongodb:27017/?authSource=admin
+      - MONGO_DB=securelogops
+
+      - WINDOW_MINUTES=5
+      - POLL_SECONDS=10
+      - AUTO_CLOSE_MINUTES=10
+      - PYTHONUNBUFFERED=1
+      - DEBUG=true
+
+      # ✅ rules
+      - FAILED_PHRASE=Failed password
+      - SSH_THRESHOLD=10
+      - PORTSCAN_THRESHOLD_PORTS=15
+
+      # ✅ security-service
+      - SECURITY_SERVICE_URL=http://security-service:8003
+      - SECURITY_API_KEY=ChangeMe_Security123!
+      - WAZUH_SUMMARY_PATH=/alerts/summary
+
+      # ✅ enrichment + backfill
+      - WAZUH_ENRICH=true
+      - WAZUH_ENRICH_TTL=60
+      - WAZUH_ENRICH_BACKFILL=true
+      - WAZUH_ENRICH_LOOKBACK_HOURS=24
+
+      - INCIDENT_COOLDOWN_SECONDS=60
+
+      # ✅ delta spike
+      - WAZUH_DELTA_ENABLED=true
+      - WAZUH_DELTA_MIN=20
+      - WAZUH_DELTA_WINDOW_SECONDS=300
+      - WAZUH_DELTA_SPAM_SECONDS=30
+
+      # ✅ incident-service
+      - INCIDENT_URL=http://incident-service:8000
+      - INCIDENT_INTERNAL_KEY=ChangeMe_Internal123!
+      - INCIDENT_TIMEOUT=5
+
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      security-service:
+        condition: service_started
+    networks:
+      - data_net
+    restart: unless-stopped
+
+volumes:
+  esdata:
+  mongodata:
+  wazuh_ossec:
+
+networks:
+  data_net:
+    driver: bridge
